@@ -727,11 +727,16 @@ def calculate_weekly_avoidable_digest(
 
 def get_gemini_client() -> genai.Client:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    if not api_key:
+        try:
+            api_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            api_key = ""
+
     if not api_key or api_key == "MY_GEMINI_API_KEY":
-        raise RuntimeError(
-            "GEMINI_API_KEY environment variable is not set. "
-            "Set it in your terminal before running Streamlit."
-        )
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
     return genai.Client(api_key=api_key)
 
 
