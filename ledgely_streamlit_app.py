@@ -17,8 +17,12 @@ Quick Start:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import sqlite3
 import uuid
 from datetime import date, datetime
@@ -125,12 +129,42 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=16384,
+        r=8,
+        p=1,
+        dklen=32,
+    )
+    return salt.hex(), digest.hex()
+
+
+def verify_password(password: str, salt_hex: str, expected_hash_hex: str) -> bool:
+    _, candidate_hex = hash_password(password, salt_hex)
+    return hmac.compare_digest(candidate_hex, expected_hash_hex)
+
+
 def init_db() -> None:
     with get_conn() as conn:
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS transactions (
                 id TEXT PRIMARY KEY,
+                owner_username TEXT NOT NULL DEFAULT 'default',
                 merchant TEXT NOT NULL,
                 amount REAL NOT NULL,
                 currency TEXT NOT NULL,
@@ -148,54 +182,133 @@ def init_db() -> None:
             )
             """
         )
+        tx_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
+        }
+        if "owner_username" not in tx_cols:
+            conn.execute(
+                "ALTER TABLE transactions ADD COLUMN owner_username TEXT NOT NULL DEFAULT 'default'"
+            )
+
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS user_settings (
+                owner_username TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (owner_username, key)
             )
             """
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS ai_reports (
-                month_key TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS user_ai_reports (
+                owner_username TEXT NOT NULL,
+                month_key TEXT NOT NULL,
                 currency TEXT NOT NULL,
                 report_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_username, month_key)
             )
             """
         )
-        conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-            ("currency", "INR"),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-            ("savings_goal", "35000"),
-        )
 
 
-def get_setting(key: str, default: str) -> str:
+def has_any_users() -> bool:
+    with get_conn() as conn:
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()
+    return bool(row and int(row["cnt"]) > 0)
+
+
+def create_user(username: str, display_name: str, password: str) -> tuple[bool, str]:
+    clean_user = username.strip().lower()
+    clean_name = display_name.strip() or clean_user
+    if not re.match(r"^[a-zA-Z0-9_.-]{3,32}$", clean_user):
+        return False, "Username must be 3–32 characters (letters, numbers, _, ., -)."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+
+    first_account = not has_any_users()
+    salt_hex, hash_hex = hash_password(password)
+    try:
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT username FROM users WHERE username = ?", (clean_user,)
+            ).fetchone()
+            if existing:
+                return False, "That username is already taken."
+
+            conn.execute(
+                """
+                INSERT INTO users (username, display_name, password_salt, password_hash, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (clean_user, clean_name[:60], salt_hex, hash_hex, datetime.utcnow().isoformat()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_settings (owner_username, key, value) VALUES (?, ?, ?)",
+                (clean_user, "currency", "INR"),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_settings (owner_username, key, value) VALUES (?, ?, ?)",
+                (clean_user, "savings_goal", "35000"),
+            )
+            if first_account:
+                conn.execute(
+                    "UPDATE transactions SET owner_username = ? WHERE owner_username = 'default'",
+                    (clean_user,),
+                )
+        return True, "Account created. You are now signed in."
+    except sqlite3.Error as exc:
+        return False, f"Database error creating user: {exc}"
+
+
+def authenticate_user(username: str, password: str) -> dict[str, str] | None:
+    clean_user = username.strip().lower()
+    if not clean_user or not password:
+        return None
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT value FROM settings WHERE key = ?", (key,)
+            "SELECT username, display_name, password_salt, password_hash FROM users WHERE username = ?",
+            (clean_user,),
+        ).fetchone()
+    if not row:
+        return None
+    if verify_password(password, str(row["password_salt"]), str(row["password_hash"])):
+        return {
+            "username": str(row["username"]),
+            "display_name": str(row["display_name"]),
+        }
+    return None
+
+
+def get_setting(username: str, key: str, default: str) -> str:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM user_settings WHERE owner_username = ? AND key = ?",
+            (username, key),
         ).fetchone()
     return str(row["value"]) if row else default
 
 
-def set_setting(key: str, value: str) -> None:
+def set_setting(username: str, key: str, value: str) -> None:
     with get_conn() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (key, value),
+            "INSERT OR REPLACE INTO user_settings (owner_username, key, value) VALUES (?, ?, ?)",
+            (username, key, value),
         )
 
 
-def fetch_transactions() -> list[dict[str, Any]]:
+def fetch_transactions(username: str) -> list[dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM transactions ORDER BY tx_date DESC, created_at DESC"
+            """
+            SELECT * FROM transactions
+            WHERE owner_username = ?
+            ORDER BY tx_date DESC, created_at DESC
+            """,
+            (username,),
         ).fetchall()
     return [
         {
@@ -218,7 +331,7 @@ def fetch_transactions() -> list[dict[str, Any]]:
     ]
 
 
-def insert_transactions(items: list[dict[str, Any]]) -> int:
+def insert_transactions(username: str, items: list[dict[str, Any]]) -> int:
     if not items:
         return 0
     now_iso = datetime.utcnow().isoformat()
@@ -227,6 +340,7 @@ def insert_transactions(items: list[dict[str, Any]]) -> int:
         rows.append(
             (
                 str(item.get("id") or f"tx_{uuid.uuid4().hex[:10]}"),
+                username,
                 str(item.get("merchant") or "Unknown")[:120],
                 round(abs(float(item.get("amount") or 0.0)), 2),
                 str(item.get("currency") or "INR")[:8],
@@ -247,10 +361,10 @@ def insert_transactions(items: list[dict[str, Any]]) -> int:
         conn.executemany(
             """
             INSERT OR REPLACE INTO transactions (
-                id, merchant, amount, currency, tx_type, category, payment_method,
+                id, owner_username, merchant, amount, currency, tx_type, category, payment_method,
                 tx_date, raw_message, sender, is_avoidable, avoidable_reason,
                 confidence, source, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -258,35 +372,44 @@ def insert_transactions(items: list[dict[str, Any]]) -> int:
 
 
 def update_transaction_fields(
-    tx_id: str, category: str, is_avoidable: bool, avoidable_reason: str
+    username: str, tx_id: str, category: str, is_avoidable: bool, avoidable_reason: str
 ) -> None:
     with get_conn() as conn:
         conn.execute(
             """
             UPDATE transactions
             SET category = ?, is_avoidable = ?, avoidable_reason = ?
-            WHERE id = ?
+            WHERE id = ? AND owner_username = ?
             """,
-            (category, 1 if is_avoidable else 0, avoidable_reason[:200], tx_id),
+            (category, 1 if is_avoidable else 0, avoidable_reason[:200], tx_id, username),
         )
 
 
-def delete_transaction(tx_id: str) -> None:
+def delete_transaction(username: str, tx_id: str) -> None:
     with get_conn() as conn:
-        conn.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
+        conn.execute(
+            "DELETE FROM transactions WHERE id = ? AND owner_username = ?",
+            (tx_id, username),
+        )
 
 
-def clear_all_transactions() -> None:
+def clear_all_transactions(username: str) -> None:
     with get_conn() as conn:
-        conn.execute("DELETE FROM transactions")
-        conn.execute("DELETE FROM ai_reports")
+        conn.execute(
+            "DELETE FROM transactions WHERE owner_username = ?",
+            (username,),
+        )
+        conn.execute(
+            "DELETE FROM user_ai_reports WHERE owner_username = ?",
+            (username,),
+        )
 
 
-def load_saved_ai_report(month_key: str) -> dict[str, Any] | None:
+def load_saved_ai_report(username: str, month_key: str) -> dict[str, Any] | None:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT report_json FROM ai_reports WHERE month_key = ?",
-            (month_key,),
+            "SELECT report_json FROM user_ai_reports WHERE owner_username = ? AND month_key = ?",
+            (username, month_key),
         ).fetchone()
     if not row:
         return None
@@ -296,14 +419,16 @@ def load_saved_ai_report(month_key: str) -> dict[str, Any] | None:
         return None
 
 
-def save_ai_report(month_key: str, currency: str, report: dict[str, Any]) -> None:
+def save_ai_report(
+    username: str, month_key: str, currency: str, report: dict[str, Any]
+) -> None:
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO ai_reports (month_key, currency, report_json, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO user_ai_reports (owner_username, month_key, currency, report_json, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (month_key, currency, json.dumps(report), datetime.utcnow().isoformat()),
+            (username, month_key, currency, json.dumps(report), datetime.utcnow().isoformat()),
         )
 
 
@@ -834,6 +959,7 @@ def ask_ai_advisor(
 
 
 def render_manual_entry_form(
+    username: str,
     form_key: str,
     currency: str,
     default_type: str = "expense",
@@ -885,6 +1011,7 @@ def render_manual_entry_form(
                 st.error("Please enter a name/source and an amount greater than 0.")
             else:
                 insert_transactions(
+                    username,
                     [
                         {
                             "id": f"manual_{uuid.uuid4().hex[:10]}",
@@ -901,13 +1028,14 @@ def render_manual_entry_form(
                             "confidence": 1.0,
                             "source": "manual",
                         }
-                    ]
+                    ],
                 )
                 st.success(f"Saved {merchant.strip()} ({format_currency(amount, currency)}).")
                 st.rerun()
 
 
 def render_home(
+    username: str,
     transactions: list[dict[str, Any]],
     metrics: dict[str, Any],
     currency: str,
@@ -923,18 +1051,18 @@ def render_home(
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### 1. Add Your Monthly Income")
-            render_manual_entry_form("welcome_income", currency, default_type="income")
+            render_manual_entry_form(username, "welcome_income", currency, default_type="income")
         with col2:
             st.markdown("#### 2. Log Your First Expense")
-            render_manual_entry_form("welcome_expense", currency, default_type="expense")
+            render_manual_entry_form(username, "welcome_expense", currency, default_type="expense")
         return
 
     with st.expander("+ Quick Add Income or Expense"):
         t1, t2 = st.tabs(["Add Expense", "Add Monthly Income"])
         with t1:
-            render_manual_entry_form("quick_expense", currency, default_type="expense")
+            render_manual_entry_form(username, "quick_expense", currency, default_type="expense")
         with t2:
-            render_manual_entry_form("quick_income", currency, default_type="income")
+            render_manual_entry_form(username, "quick_income", currency, default_type="income")
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric(
@@ -1224,10 +1352,12 @@ def render_reports(
         )
 
 
-def render_transactions(transactions: list[dict[str, Any]], currency: str) -> None:
+def render_transactions(
+    username: str, transactions: list[dict[str, Any]], currency: str
+) -> None:
     st.subheader("All Transactions")
     with st.expander("+ Add Income or Expense"):
-        render_manual_entry_form("txn_page_add", currency)
+        render_manual_entry_form(username, "txn_page_add", currency)
 
     c1, c2, c3 = st.columns(3)
     query = c1.text_input("Search shop, category, or SMS text")
@@ -1248,6 +1378,17 @@ def render_transactions(transactions: list[dict[str, Any]], currency: str) -> No
         filtered = [t for t in filtered if t["type"] == type_filter]
     if cat_filter != "All":
         filtered = [t for t in filtered if t["category"] == cat_filter]
+
+    if filtered:
+        f_inc = sum(t["amount"] for t in filtered if t["type"] == "income")
+        f_exp = sum(t["amount"] for t in filtered if t["type"] == "expense")
+        f_avoid = sum(
+            t["amount"] for t in filtered if t["type"] == "expense" and t["isAvoidable"]
+        )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Filtered Income", format_currency(f_inc, currency))
+        m2.metric("Filtered Spend", format_currency(f_exp, currency))
+        m3.metric("Filtered Optional Spend", format_currency(f_avoid, currency))
 
     st.caption(f"Showing {len(filtered)} of {len(transactions)} transactions")
 
@@ -1289,7 +1430,7 @@ def render_transactions(transactions: list[dict[str, Any]], currency: str) -> No
                     r2.caption(f"Optional spend: {tx['avoidableReason'] or 'Marked avoidable'}")
 
                 if r3.button("Delete", key=f"del_{tx['id']}"):
-                    delete_transaction(tx["id"])
+                    delete_transaction(username, tx["id"])
                     st.rerun()
 
                 if tx["type"] == "expense":
@@ -1314,12 +1455,14 @@ def render_transactions(transactions: list[dict[str, Any]], currency: str) -> No
                         )
                         if st.button("Update", key=f"upd_{tx['id']}"):
                             update_transaction_fields(
-                                tx["id"], new_cat, new_avoid, new_reason
+                                username, tx["id"], new_cat, new_avoid, new_reason
                             )
                             st.rerun()
 
 
-def render_sms_sync(transactions: list[dict[str, Any]], currency: str) -> None:
+def render_sms_sync(
+    username: str, transactions: list[dict[str, Any]], currency: str
+) -> None:
     st.subheader("Read Bank & UPI SMS Messages (Gemini AI)")
     st.write(
         "Paste bank, card, or UPI SMS alerts below (one per line) or upload a .txt, .csv, or .json file. "
@@ -1356,7 +1499,7 @@ def render_sms_sync(transactions: list[dict[str, Any]], currency: str) -> None:
                     and float(r.get("amount") or 0) > 0
                 ]
                 if st.button(f"Import {len(valid)} JSON Transaction(s)", type="primary"):
-                    count = insert_transactions(valid)
+                    count = insert_transactions(username, valid)
                     st.success(f"Imported {count} transaction(s) from JSON.")
                     st.rerun()
             except Exception as exc:
@@ -1375,7 +1518,7 @@ def render_sms_sync(transactions: list[dict[str, Any]], currency: str) -> None:
                         lines, currency, DEFAULT_REFERENCE_DATE
                     )
                     if parsed:
-                        insert_transactions(parsed)
+                        insert_transactions(username, parsed)
                         st.session_state.sms_draft = ""
                         st.success(
                             f"Added {len(parsed)} payment(s) ({ignored} non-payment/OTP message ignored)."
@@ -1403,13 +1546,14 @@ def render_sms_sync(transactions: list[dict[str, Any]], currency: str) -> None:
 
 
 def render_advisor(
+    username: str,
     transactions: list[dict[str, Any]],
     metrics: dict[str, Any],
     currency: str,
     current_month_key: str,
 ) -> None:
     st.subheader("Tips & AI Savings Plan")
-    saved_report = load_saved_ai_report(current_month_key)
+    saved_report = load_saved_ai_report(username, current_month_key)
 
     summary_payload = {
         "month": metrics["currentMonthLabel"],
@@ -1433,77 +1577,145 @@ def render_advisor(
         ],
     }
 
-    if st.button("Generate / Refresh AI Savings Plan", type="primary"):
-        with st.spinner("Analyzing spending patterns with Gemini AI..."):
-            try:
-                report = generate_ai_advice_with_gemini(summary_payload, currency)
-                save_ai_report(current_month_key, currency, report)
-                saved_report = report
-                st.success("AI financial plan updated.")
-            except Exception as exc:
-                st.error(f"Could not generate AI plan: {exc}")
+    tab_plan, tab_digest, tab_ask = st.tabs(
+        ["AI Savings Plan", "Weekly Optional Digest", "Ask Advisor"]
+    )
 
-    if saved_report:
-        st.markdown(f"### {saved_report.get('headline', '')}")
-        st.write(saved_report.get("monthlyDiagnosis", ""))
+    with tab_plan:
+        if st.button("Generate / Refresh AI Savings Plan", type="primary"):
+            with st.spinner("Analyzing spending patterns with Gemini AI..."):
+                try:
+                    report = generate_ai_advice_with_gemini(summary_payload, currency)
+                    save_ai_report(username, current_month_key, currency, report)
+                    saved_report = report
+                    st.success("AI financial plan updated.")
+                except Exception as exc:
+                    st.error(f"Could not generate AI plan: {exc}")
 
-        recs = saved_report.get("recommendations", [])
-        if recs:
-            st.markdown("#### Recommended Money Moves")
-            for rec in recs:
-                with st.container(border=True):
-                    st.markdown(
-                        f"**{rec.get('title', '')}** · Priority: {rec.get('priority', 'Medium')} · "
-                        f"Est. Savings: **{format_currency(float(rec.get('estimatedMonthlySavings', 0)), currency)}/mo**"
-                    )
-                    st.write(rec.get("steps", ""))
-    else:
-        st.info("Click **Generate / Refresh AI Savings Plan** to get tailored recommendations.")
+        if saved_report:
+            st.markdown(f"### {saved_report.get('headline', '')}")
+            st.write(saved_report.get("monthlyDiagnosis", ""))
 
-    st.divider()
-    st.subheader("Weekly Optional Spend Digest")
-    buckets = calculate_weekly_avoidable_digest(transactions, current_month_key)
-    if not buckets:
-        st.caption("No weekly expenses recorded for this month yet.")
-    else:
-        for b in buckets:
-            with st.expander(
-                f"{b['weekLabel']} ({b['rangeLabel']}) — Optional: {format_currency(b['avoidableTotal'], currency)} "
-                f"({b['avoidableSharePct']:.0f}% of weekly spend)"
-            ):
-                if not b["items"]:
-                    st.write("No avoidable expenses flagged in this week.")
-                else:
-                    for item in b["items"]:
-                        st.write(
-                            f"- **{item['merchant']}** ({item['category']}): "
-                            f"{format_currency(item['amount'], currency)} — {item['avoidableReason']}"
+            spikes = saved_report.get("spikeAlerts", [])
+            avoid_items = saved_report.get("avoidableBreakdown", [])
+            if spikes or avoid_items:
+                scol, acol = st.columns(2)
+                with scol:
+                    st.markdown("#### Spending Spike Insights")
+                    for sp in spikes:
+                        with st.container(border=True):
+                            st.markdown(
+                                f"**{sp.get('category', '')}** · +{format_currency(float(sp.get('increaseAmount', 0)), currency)}"
+                            )
+                            st.write(sp.get("explanation", ""))
+                            st.caption(f"Action: {sp.get('action', '')}")
+                with acol:
+                    st.markdown("#### Avoidable Cost Breakdown")
+                    for av in avoid_items:
+                        with st.container(border=True):
+                            st.markdown(
+                                f"**{av.get('title', '')}** · {format_currency(float(av.get('monthlyCost', 0)), currency)}/mo"
+                            )
+                            st.write(av.get("suggestion", ""))
+
+            recs = saved_report.get("recommendations", [])
+            if recs:
+                st.markdown("#### Recommended Money Moves")
+                for rec in recs:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**{rec.get('title', '')}** · Priority: {rec.get('priority', 'Medium')} · "
+                            f"Est. Savings: **{format_currency(float(rec.get('estimatedMonthlySavings', 0)), currency)}/mo**"
                         )
+                        st.write(rec.get("steps", ""))
+        else:
+            st.info("Click **Generate / Refresh AI Savings Plan** to get tailored recommendations.")
 
-    st.divider()
-    st.subheader("Ask Your Financial Advisor")
-    starters = [
-        "How can I save more money this month?",
-        "Which expense category jumped the most?",
-        "What optional purchases should I cut first?",
-    ]
-    if "advisor_q" not in st.session_state:
-        st.session_state.advisor_q = ""
+    with tab_digest:
+        st.subheader("Weekly Optional Spend Digest")
+        buckets = calculate_weekly_avoidable_digest(transactions, current_month_key)
+        if not buckets:
+            st.caption("No weekly expenses recorded for this month yet.")
+        else:
+            for b in buckets:
+                with st.expander(
+                    f"{b['weekLabel']} ({b['rangeLabel']}) — Optional: {format_currency(b['avoidableTotal'], currency)} "
+                    f"({b['avoidableSharePct']:.0f}% of weekly spend)"
+                ):
+                    if not b["items"]:
+                        st.write("No avoidable expenses flagged in this week.")
+                    else:
+                        for item in b["items"]:
+                            st.write(
+                                f"- **{item['merchant']}** ({item['category']}): "
+                                f"{format_currency(item['amount'], currency)} — {item['avoidableReason']}"
+                            )
 
-    scols = st.columns(len(starters))
-    for col, q_text in zip(scols, starters):
-        if col.button(q_text, use_container_width=True):
-            st.session_state.advisor_q = q_text
+    with tab_ask:
+        st.subheader("Ask Your Financial Advisor")
+        starters = [
+            "How can I save more money this month?",
+            "Which expense category jumped the most?",
+            "What optional purchases should I cut first?",
+        ]
+        if "advisor_q" not in st.session_state:
+            st.session_state.advisor_q = ""
 
-    question = st.text_input("Ask a question about your finances", value=st.session_state.advisor_q)
-    st.session_state.advisor_q = question
-    if st.button("Ask Advisor") and question.strip():
-        with st.spinner("Thinking..."):
-            try:
-                answer = ask_ai_advisor(question.strip(), summary_payload, currency)
-                st.success(answer)
-            except Exception as exc:
-                st.error(f"Advisor request failed: {exc}")
+        scols = st.columns(len(starters))
+        for col, q_text in zip(scols, starters):
+            if col.button(q_text, use_container_width=True):
+                st.session_state.advisor_q = q_text
+
+        question = st.text_input("Ask a question about your finances", value=st.session_state.advisor_q)
+        st.session_state.advisor_q = question
+        if st.button("Ask Advisor", type="primary") and question.strip():
+            with st.spinner("Thinking..."):
+                try:
+                    answer = ask_ai_advisor(question.strip(), summary_payload, currency)
+                    st.success(answer)
+                except Exception as exc:
+                    st.error(f"Advisor request failed: {exc}")
+
+
+def render_auth_gate() -> None:
+    st.title("Ledgely")
+    st.subheader("Sign in to your private expense & savings tracker")
+    st.write(
+        "Your transactions, goals, and AI savings plans stay isolated per account in local SQLite storage (ledgely_data.db)."
+    )
+    tab_login, tab_register = st.tabs(["Sign In", "Create Account"])
+
+    with tab_login:
+        with st.form("login_form"):
+            l_user = st.text_input("Username")
+            l_pass = st.text_input("Password", type="password")
+            if st.form_submit_button("Sign In", type="primary"):
+                account = authenticate_user(l_user, l_pass)
+                if account:
+                    st.session_state.auth_user = account
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+
+    with tab_register:
+        with st.form("register_form"):
+            r_name = st.text_input("Display Name", placeholder="e.g., Alex")
+            r_user = st.text_input("Username", placeholder="letters, numbers, _ . -")
+            r_pass = st.text_input("Password (min 6 characters)", type="password")
+            r_confirm = st.text_input("Confirm Password", type="password")
+            if st.form_submit_button("Create Account", type="primary"):
+                if r_pass != r_confirm:
+                    st.error("Passwords do not match.")
+                else:
+                    ok, msg = create_user(r_user, r_name, r_pass)
+                    if ok:
+                        st.session_state.auth_user = {
+                            "username": r_user.strip().lower(),
+                            "display_name": r_name.strip() or r_user.strip().lower(),
+                        }
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -1519,12 +1731,20 @@ def main() -> None:
     )
     init_db()
 
-    currency = get_setting("currency", "INR")
+    auth_user = st.session_state.get("auth_user")
+    if not auth_user:
+        render_auth_gate()
+        return
+
+    username = auth_user["username"]
+    display_name = auth_user.get("display_name") or username
+
+    currency = get_setting(username, "currency", "INR")
     if currency not in CURRENCY_META:
         currency = "INR"
-    savings_goal = float(get_setting("savings_goal", "35000") or 35000)
+    savings_goal = float(get_setting(username, "savings_goal", "35000") or 35000)
 
-    transactions = fetch_transactions()
+    transactions = fetch_transactions(username)
     current_month_key = DEFAULT_REFERENCE_DATE[:7]
     ref_day = int(DEFAULT_REFERENCE_DATE[8:10])
     metrics = calculate_monthly_metrics(transactions, current_month_key, currency, ref_day)
@@ -1543,6 +1763,7 @@ def main() -> None:
         )
 
         st.divider()
+        st.caption("Settings & Goal")
         new_currency = st.selectbox(
             "Currency",
             options=list(CURRENCY_META.keys()),
@@ -1550,7 +1771,7 @@ def main() -> None:
             format_func=lambda c: CURRENCY_META[c]["label"],
         )
         if new_currency != currency:
-            set_setting("currency", new_currency)
+            set_setting(username, "currency", new_currency)
             currency = new_currency
             st.rerun()
 
@@ -1561,30 +1782,37 @@ def main() -> None:
             value=savings_goal,
         )
         if abs(new_goal - savings_goal) > 0.01:
-            set_setting("savings_goal", str(round(new_goal)))
+            set_setting(username, "savings_goal", str(round(new_goal)))
             savings_goal = new_goal
 
         pct = max(0.0, min(100.0, (metrics["netSavings"] / savings_goal) * 100.0)) if savings_goal > 0 else 0.0
-        st.progress(pct / 100.0, text=f"{pct:.0f}% of goal saved")
+        st.progress(pct / 100.0, text=f"{pct:.0f}% of goal saved · {len(transactions)} entries")
+
+        st.divider()
+        st.caption("Account")
+        st.write(f"Signed in as **{display_name}** (@{username})")
+        if st.button("Sign Out", use_container_width=True):
+            st.session_state.pop("auth_user", None)
+            st.rerun()
 
         st.divider()
         with st.expander("Clear All Data"):
-            st.warning("This removes all saved transactions and cached AI reports from ledgely_data.db.")
+            st.warning("This removes all saved transactions and cached AI reports for your account.")
             if st.button("Yes, Delete All Data", type="primary"):
-                clear_all_transactions()
+                clear_all_transactions(username)
                 st.rerun()
 
     st.header(nav)
     if nav == "Home":
-        render_home(transactions, metrics, currency, current_month_key)
+        render_home(username, transactions, metrics, currency, current_month_key)
     elif nav == "Reports":
         render_reports(transactions, currency, savings_goal, current_month_key)
     elif nav == "All Transactions":
-        render_transactions(transactions, currency)
+        render_transactions(username, transactions, currency)
     elif nav == "SMS & Phone Sync":
-        render_sms_sync(transactions, currency)
+        render_sms_sync(username, transactions, currency)
     elif nav == "Tips & Savings Plan":
-        render_advisor(transactions, metrics, currency, current_month_key)
+        render_advisor(username, transactions, metrics, currency, current_month_key)
 
 
 if __name__ == "__main__":
